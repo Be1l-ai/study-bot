@@ -40,46 +40,19 @@ gh repo create study-bot --private --push --source=.
 
 ---
 
-### Step 3 — Deploy on Fly.io
+### Step 3 — Deploy on Render
 
-1. Install the Fly CLI and sign in:
+1. Create a new **Web Service** in the Render dashboard and connect this GitHub repo.
+2. Render should detect `render.yaml`. If you prefer manual setup, use these values:
 
-```bash
-fly auth login
-```
+| Setting | Value |
+|---|---|
+| Environment | Python |
+| Build Command | `pip install -r requirements.txt` |
+| Start Command | `python bot.py` |
+| Plan | Free |
 
-2. Launch the app from this repo:
-
-```bash
-fly launch
-```
-
-3. When Fly asks about the existing config, keep `fly.toml` and deploy as a **worker**.
-4. Create the persistent volume for SQLite data:
-
-```bash
-fly volumes create study_bot_data --size 1 --region iad
-```
-
-5. Set your secrets:
-
-```bash
-fly secrets set BOT_TOKEN=... GROQ_KEY=... CHAT_ID=...
-```
-
-6. Deploy:
-
-```bash
-fly deploy
-```
-
-7. If needed, scale the worker to 1 machine:
-
-```bash
-fly scale count 1
-```
-
-Add these environment variables in `fly.toml` or as secrets if you prefer:
+3. Add these environment variables:
 
 | Variable | Value |
 |---|---|
@@ -88,9 +61,16 @@ Add these environment variables in `fly.toml` or as secrets if you prefer:
 | `CHAT_ID` | your Telegram chat ID |
 | `TOPIC_INTERVAL` | `600` (10 min) or `900` (15 min) |
 | `QUIZ_DELAY` | `1800` (30 min) |
-| `DB_PATH` | `/data/study_bot.db` |
+| `PORT` | `10000` |
 
-The SQLite database is stored on a Fly volume at `/data/study_bot.db`, so your session state survives restarts.
+4. Add an external uptime check to hit your service every 10 minutes.
+	- Set it to request `https://<your-app>.onrender.com/health`
+	- UptimeRobot, Better Stack, or a similar ping service works
+	- That keeps the free web service warm so it is less likely to sleep
+
+The bot now exposes a tiny HTTP health endpoint for Render while Telegram polling runs in the background.
+
+Note: Render free web services do not have persistent disks, so the SQLite file is ephemeral. That is usually fine here because sessions end after the PDF is learned.
 
 ---
 
@@ -141,7 +121,6 @@ study-bot/
 ├── storage.py        — SQLite wrapper (topics, state)
 ├── requirements.txt
 ├── Procfile          — worker command for generic hosts
-├── Dockerfile        — container build for Fly.io
-├── fly.toml          — Fly.io worker + volume config
+├── render.yaml       — Render web service config
 └── .env.example      — Environment variable template
 ```

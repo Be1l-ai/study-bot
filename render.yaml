@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: study-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    autoDeploy: false
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: GROQ_KEY
+        sync: false
+      - key: CHAT_ID
+        sync: false
+      - key: TOPIC_INTERVAL
+        value: "900"
+      - key: QUIZ_DELAY
+        value: "1800"
+      - key: PORT
+        value: "10000"

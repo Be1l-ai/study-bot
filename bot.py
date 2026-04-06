@@ -19,6 +19,7 @@ Quiz flow:
 """
 
 import asyncio
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import logging
 import os
@@ -26,6 +27,7 @@ import re
 import tempfile
 import time
 from pathlib import Path
+import threading
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import TimedOut
@@ -78,6 +80,7 @@ GROQ_KEY       = os.environ["GROQ_KEY"]
 CHAT_ID        = os.environ["CHAT_ID"]
 TOPIC_INTERVAL = int(os.environ.get("TOPIC_INTERVAL", "900"))   # default 15 min
 QUIZ_DELAY     = int(os.environ.get("QUIZ_DELAY",     "1800"))  # default 30 min
+WEB_PORT       = int(os.environ.get("PORT", "10000"))
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -99,6 +102,32 @@ quiz_sending: bool = False
 # Active /answer session: which quiz the user is currently working through.
 # { "topic_id": int, "q_index": int, "score": int, "questions": [...], "answers": [...] }
 answer_session: dict | None = None
+
+
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path in ("/", "/health", "/healthz"):
+            body = b"ok"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        self.send_response(404)
+        self.end_headers()
+
+    def log_message(self, format, *args):
+        return
+
+
+def start_health_server() -> ThreadingHTTPServer:
+    server = ThreadingHTTPServer(("0.0.0.0", WEB_PORT), _HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    logger.info("Health server listening on port %s", WEB_PORT)
+    return server
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -556,6 +585,7 @@ def build_app() -> Application:
 
 def main():
     # Retry on transient Telegram timeouts instead of crashing at startup.
+    start_health_server()
     while True:
         app = build_app()
 
