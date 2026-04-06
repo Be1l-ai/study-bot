@@ -9,6 +9,14 @@ logger = logging.getLogger(__name__)
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 MODEL    = "llama-3.3-70b-versatile"
 
+_FULL_DATE_RE = re.compile(
+    r'\b(?:January|February|March|April|May|June|July|'
+    r'August|September|October|November|December)'
+    r'\s+\d{1,2},?\s+\d{4}\b',
+    re.IGNORECASE,
+)
+_YEAR_RE = re.compile(r'\b\d{4}\b')
+
 
 def _call_groq(groq_key: str, prompt: str, max_tokens: int = 900, temperature: float = 0.7) -> str:
     headers = {"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"}
@@ -33,15 +41,18 @@ def _call_groq(groq_key: str, prompt: str, max_tokens: int = 900, temperature: f
 
 ENRICH_PROMPT = """You are a study companion helping someone memorize academic content.
 
-Take the raw text below and rewrite it in an engaging, vivid, story-driven way.
-Keep it casual, light, and a little playful — like a smart friend explaining it fast.
+Teach the exact topic from the raw text like an exam tutor with internet humor.
+Keep it casual and readable, but prioritize depth over style.
 
 STRICT RULES — never break these:
 - Keep every name, date, place, and number EXACTLY as written. Do not add or invent any.
 - Do not remove any factual information from the source.
-- Use analogies, comparisons, or a narrative tone to make it memorable.
-- Prefer 2-3 short paragraphs.
-- You may include 1 tiny bullet list if it makes the key points easier to scan.
+- Explain the core idea, then key details, then why it matters.
+- Include concrete facts from the source (who, what, when, where, why/how).
+- Keep it focused on the current topic only; do not drift into unrelated sections.
+- Do not compress everything into a shallow summary.
+- Prefer 3-5 short paragraphs.
+- You may include 1-3 short bullet list for critical facts if it improves clarity.
 - Keep the wording clean, modern, and not overly formal.
 - Plain text only — no markdown.
 
@@ -51,12 +62,27 @@ RAW TEXT:
 
 def make_interesting(raw_text: str, groq_key: str) -> str:
     try:
-        return _call_groq(
+        rewritten = _call_groq(
             groq_key,
             ENRICH_PROMPT.format(text=raw_text[:3000]),
             max_tokens=900,
-            temperature=0.75,
+            temperature=0.45,
         )
+
+        raw_dates = set(_FULL_DATE_RE.findall(raw_text))
+        out_dates = set(_FULL_DATE_RE.findall(rewritten))
+        raw_years = set(_YEAR_RE.findall(raw_text))
+        out_years = set(_YEAR_RE.findall(rewritten))
+
+        # If key date/year details drift, return source text to avoid misinformation.
+        if not raw_dates.issubset(out_dates):
+            logger.warning("Enriched output missing date details; using raw text fallback")
+            return raw_text
+        if not raw_years.issubset(out_years):
+            logger.warning("Enriched output missing year details; using raw text fallback")
+            return raw_text
+
+        return rewritten
     except Exception:
         return raw_text  # fallback: send raw text unchanged
 

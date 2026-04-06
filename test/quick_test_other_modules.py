@@ -2,6 +2,7 @@ import json
 import os
 import shutil
 import tempfile
+from datetime import datetime, timedelta
 import unittest
 from unittest.mock import patch
 
@@ -97,9 +98,24 @@ class TestStorageModule(unittest.TestCase):
         storage.set_state("phase", "running")
         self.assertEqual(storage.get_state("phase"), "running")
 
+    def test_get_topics_ready_for_quiz_respects_delay_and_iso_timestamps(self):
+        storage.add_topics([("raw one", "interesting one")])
+        topic_id = storage.get_next_unsent()["id"]
+        storage.mark_sent(topic_id, 200)
+
+        old_time = (datetime.utcnow() - timedelta(minutes=31)).isoformat()
+        conn = storage.get_conn()
+        conn.execute("UPDATE topics SET sent_at=? WHERE id=?", (old_time, topic_id))
+        conn.commit()
+        conn.close()
+
+        ready = storage.get_topics_ready_for_quiz(delay_seconds=1800)
+        self.assertEqual(len(ready), 1)
+        self.assertEqual(ready[0]["id"], topic_id)
+
 
 class TestLlmProcessorModule(unittest.TestCase):
-    def test_enrich_prompt_allows_casual_bullets(self):
+    def test_enrich_prompt_targets_exam_depth(self):
         captured = {}
 
         def fake_call(groq_key, prompt, max_tokens=900, temperature=0.7):
@@ -110,13 +126,20 @@ class TestLlmProcessorModule(unittest.TestCase):
             llm_processor.make_interesting("raw text", "fake-key")
 
         prompt = captured["prompt"]
-        self.assertIn("casual, light, and a little playful", prompt)
-        self.assertIn("1 tiny bullet list", prompt)
-        self.assertIn("Prefer 2-3 short paragraphs", prompt)
+    self.assertIn("Teach the exact topic from the raw text like an exam tutor", prompt)
+    self.assertIn("do not compress everything into a shallow summary", prompt)
+    self.assertIn("Prefer 3-5 short paragraphs", prompt)
 
     def test_make_interesting_falls_back_on_error(self):
         raw = "Original factual text"
         with patch("llm_processor._call_groq", side_effect=Exception("api down")):
+            out = llm_processor.make_interesting(raw, "fake-key")
+        self.assertEqual(out, raw)
+
+    def test_make_interesting_falls_back_when_key_dates_or_years_missing(self):
+        raw = "Battle happened on June 19, 1861 and ended in 1862."
+        rewritten = "The battle happened in an old era and changed everything."
+        with patch("llm_processor._call_groq", return_value=rewritten):
             out = llm_processor.make_interesting(raw, "fake-key")
         self.assertEqual(out, raw)
 

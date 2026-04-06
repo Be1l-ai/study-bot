@@ -535,7 +535,7 @@ async def scheduler_loop(app: Application):
             now = time.time()
 
             # ── 1. Trigger quizzes for overdue topics (one at a time) ────────
-            for topic in storage.get_topics_ready_for_quiz():
+            for topic in storage.get_topics_ready_for_quiz(QUIZ_DELAY):
                 await _run_quiz_for_topic(app.bot, topic)
                 # _run_quiz_for_topic already resets last_message_at
                 now = time.time()

@@ -90,11 +90,61 @@ _PLACE_RE = re.compile(
     r'\b[A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,}){0,3}\b'  # 1–4 capitalised words
 )
 
+_MAX_MARKER_LINK_GAP = 6
+_MAX_CLUSTER_PAGE_GAP = 2
+_MAX_TOPIC_CHARS = 2400
+
 
 def _extract_markers(text: str) -> set[str]:
     dates  = set(_DATE_RE.findall(text))
     places = set(_PLACE_RE.findall(text))
     return dates | places
+
+
+def _contiguous_runs(cluster_pages: list[dict]) -> list[list[dict]]:
+    """Split a cluster into nearby page runs to avoid over-merged topics."""
+    if not cluster_pages:
+        return []
+
+    sorted_pages = sorted(cluster_pages, key=lambda p: p["page_num"])
+    runs: list[list[dict]] = [[sorted_pages[0]]]
+    for page in sorted_pages[1:]:
+        prev = runs[-1][-1]
+        if page["page_num"] - prev["page_num"] <= _MAX_CLUSTER_PAGE_GAP:
+            runs[-1].append(page)
+        else:
+            runs.append([page])
+    return runs
+
+
+def _chunk_run(run_pages: list[dict]) -> list[str]:
+    """Chunk long runs so each topic is teachable instead of one giant summary."""
+    chunks: list[str] = []
+    current_parts: list[str] = []
+    current_len = 0
+
+    for page in run_pages:
+        text = page["text"].strip()
+        if not text:
+            continue
+
+        candidate_len = current_len + len(text) + (1 if current_parts else 0)
+        if current_parts and candidate_len > _MAX_TOPIC_CHARS:
+            combined = " ".join(current_parts).strip()
+            if len(combined) > 80:
+                chunks.append(combined)
+            current_parts = [text]
+            current_len = len(text)
+        else:
+            current_parts.append(text)
+            current_len = candidate_len
+
+    if current_parts:
+        combined = " ".join(current_parts).strip()
+        if len(combined) > 80:
+            chunks.append(combined)
+
+    return chunks
 
 
 def group_into_topics(cleaned_pages: list[dict]) -> list[str]:
@@ -139,30 +189,28 @@ def group_into_topics(cleaned_pages: list[dict]) -> list[str]:
             parent[b] = a
 
     for pages_sharing in marker_to_pages.values():
-        for i in range(1, len(pages_sharing)):
-            union(pages_sharing[0], pages_sharing[i])
+        seq = sorted(set(pages_sharing))
+        for i in range(1, len(seq)):
+            # Link only reasonably close pages so one recurring marker does not
+            # collapse the whole document into one giant topic.
+            if seq[i] - seq[i - 1] <= _MAX_MARKER_LINK_GAP:
+                union(seq[i - 1], seq[i])
 
     # Group pages by cluster root
     clusters: dict[int, list[dict]] = defaultdict(list)
     for page in cleaned_pages:
         clusters[find(page["page_num"])].append(page)
 
-    # Build topic strings; sort pages within each cluster by page number
-    topics = []
-    for cluster_pages in clusters.values():
-        cluster_pages.sort(key=lambda p: p["page_num"])
-        combined = " ".join(p["text"] for p in cluster_pages).strip()
-        if len(combined) > 80:
-            topics.append(combined)
-
-    # Sort topics by first page number so they arrive in document order
-    # (clusters are keyed by root which is the lowest page_num in the group)
+    # Sort topics by first page number so they arrive in document order.
+    # Each cluster is further split into contiguous runs and size-limited chunks.
     topics_with_order = []
-    for root, cluster_pages in clusters.items():
-        cluster_pages.sort(key=lambda p: p["page_num"])
-        combined = " ".join(p["text"] for p in cluster_pages).strip()
-        if len(combined) > 80:
-            topics_with_order.append((min(p["page_num"] for p in cluster_pages), combined))
+    for cluster_pages in clusters.values():
+        for run in _contiguous_runs(cluster_pages):
+            if not run:
+                continue
+            run_start = min(p["page_num"] for p in run)
+            for chunk in _chunk_run(run):
+                topics_with_order.append((run_start, chunk))
 
     topics_with_order.sort(key=lambda t: t[0])
     return [t for _, t in topics_with_order]

@@ -128,13 +128,20 @@ def mark_quiz_answered(topic_id):
     conn.close()
 
 
-def get_topics_ready_for_quiz():
-    """Topics sent 30+ min ago that haven't had a quiz generated yet."""
+def get_topics_ready_for_quiz(delay_seconds: int = 1800):
+    """Topics sent delay_seconds ago that haven't had a quiz generated yet."""
+    try:
+        seconds = max(1, int(delay_seconds))
+    except Exception:
+        seconds = 1800
+
+    offset = f"-{seconds} seconds"
     conn = get_conn()
     rows = conn.execute(
         """SELECT * FROM topics
            WHERE sent=1 AND learned=0 AND quiz_generated=0
-             AND sent_at < datetime('now', '-30 minutes')"""
+             AND datetime(replace(sent_at, 'T', ' ')) < datetime('now', ?)""",
+        (offset,),
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]

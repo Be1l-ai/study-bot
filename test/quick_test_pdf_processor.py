@@ -1,6 +1,6 @@
 import unittest
 
-from pdf_processor import remove_headers_footers
+from pdf_processor import group_into_topics, remove_headers_footers
 
 
 class TestPdfProcessorHeaderFooterRules(unittest.TestCase):
@@ -120,6 +120,48 @@ class TestPdfProcessorHeaderFooterRules(unittest.TestCase):
             text = page["text"]
             self.assertNotIn("Consistent Footer Line Across All Pages", text)
             self.assertIn(repeated_title, text)
+
+
+class TestPdfTopicGrouping(unittest.TestCase):
+    def test_same_marker_far_apart_pages_do_not_collapse_to_one_topic(self):
+        cleaned_pages = []
+
+        for i in range(4):
+            cleaned_pages.append({
+                "page_num": i,
+                "text": (
+                    "June 19, 1861 event details in Manila. "
+                    "This paragraph contains enough explanatory material for testing."
+                ),
+            })
+
+        for i in range(15, 19):
+            cleaned_pages.append({
+                "page_num": i,
+                "text": (
+                    "June 19, 1861 event details in Manila. "
+                    "Another distant section with enough explanatory material for testing."
+                ),
+            })
+
+        topics = group_into_topics(cleaned_pages)
+        self.assertGreaterEqual(len(topics), 2)
+
+    def test_long_contiguous_run_is_split_into_multiple_topics(self):
+        cleaned_pages = []
+        long_piece = (
+            "Cebu City chapter details and timeline with names and events "
+            "for exam preparation and understanding. "
+        ) * 30
+
+        for i in range(8):
+            cleaned_pages.append({
+                "page_num": i,
+                "text": f"June 19, 1861 {long_piece}",
+            })
+
+        topics = group_into_topics(cleaned_pages)
+        self.assertGreaterEqual(len(topics), 2)
 
 
 if __name__ == "__main__":
