@@ -37,8 +37,6 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-
-import storage
 from llm_processor import generate_quiz, make_interesting
 from pdf_processor import process_pdf
 
@@ -72,6 +70,8 @@ def _load_env_file(path: str = ".env") -> None:
 
 
 _load_env_file()
+
+import storage
 
 BOT_TOKEN      = os.environ["BOT_TOKEN"]
 GROQ_KEY       = os.environ["GROQ_KEY"]

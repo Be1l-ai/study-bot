@@ -40,12 +40,46 @@ gh repo create study-bot --private --push --source=.
 
 ---
 
-### Step 3 — Deploy on Railway
+### Step 3 — Deploy on Fly.io
 
-1. Go to [railway.app](https://railway.app) and sign in with GitHub
-2. Click **New Project → Deploy from GitHub repo** → select `study-bot`
-3. Railway will detect the `Procfile` and configure it as a **worker** automatically
-4. Go to your project → **Variables** tab → add these:
+1. Install the Fly CLI and sign in:
+
+```bash
+fly auth login
+```
+
+2. Launch the app from this repo:
+
+```bash
+fly launch
+```
+
+3. When Fly asks about the existing config, keep `fly.toml` and deploy as a **worker**.
+4. Create the persistent volume for SQLite data:
+
+```bash
+fly volumes create study_bot_data --size 1 --region iad
+```
+
+5. Set your secrets:
+
+```bash
+fly secrets set BOT_TOKEN=... GROQ_KEY=... CHAT_ID=...
+```
+
+6. Deploy:
+
+```bash
+fly deploy
+```
+
+7. If needed, scale the worker to 1 machine:
+
+```bash
+fly scale count 1
+```
+
+Add these environment variables in `fly.toml` or as secrets if you prefer:
 
 | Variable | Value |
 |---|---|
@@ -54,10 +88,9 @@ gh repo create study-bot --private --push --source=.
 | `CHAT_ID` | your Telegram chat ID |
 | `TOPIC_INTERVAL` | `600` (10 min) or `900` (15 min) |
 | `QUIZ_DELAY` | `1800` (30 min) |
+| `DB_PATH` | `/data/study_bot.db` |
 
-5. Railway will automatically redeploy. Your bot is live.
-
-> **Note:** Railway's free Hobby tier gives $5/month free credit. A small worker like this uses roughly $0.50–$1/month so it fits comfortably.
+The SQLite database is stored on a Fly volume at `/data/study_bot.db`, so your session state survives restarts.
 
 ---
 
@@ -107,6 +140,8 @@ study-bot/
 ├── llm_processor.py  — Groq API: enrich topics, generate quizzes
 ├── storage.py        — SQLite wrapper (topics, state)
 ├── requirements.txt
-├── Procfile          — Railway worker config
+├── Procfile          — worker command for generic hosts
+├── Dockerfile        — container build for Fly.io
+├── fly.toml          — Fly.io worker + volume config
 └── .env.example      — Environment variable template
 ```
