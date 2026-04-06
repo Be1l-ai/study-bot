@@ -589,6 +589,9 @@ def main():
     while True:
         app = build_app()
 
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
         logger.info("Polling…")
         try:
             app.run_polling(
@@ -604,6 +607,11 @@ def main():
         except TimedOut as e:
             logger.warning("Telegram API timed out: %s. Retrying in 5 seconds...", e)
             time.sleep(5)
+        finally:
+            try:
+                loop.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

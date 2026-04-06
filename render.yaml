@@ -3,12 +3,10 @@ services:
     name: study-bot
     env: python
     plan: free
-    buildCommand: pip install --prefer-binary -r requirements.txt
+    buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
     autoDeploy: false
     envVars:
-      - key: PYTHON_VERSION
-        value: "3.11.11"
       - key: BOT_TOKEN
         sync: false
       - key: GROQ_KEY
