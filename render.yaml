@@ -11,7 +11,7 @@ services:
         sync: false
       - key: GROQ_KEY
         sync: false
-      - key: CHAT_ID
+      - key: ALLOWED_CHAT_IDS
         sync: false
       - key: TOPIC_INTERVAL
         value: "900"

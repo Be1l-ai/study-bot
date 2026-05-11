@@ -21,8 +21,9 @@ A Telegram bot that turns any PDF into a timed study session with quizzes.
 **Telegram bot token**
 - Message [@BotFather](https://t.me/BotFather) → `/newbot` → follow prompts → copy the token
 
-**Your Telegram Chat ID**
+**Your Telegram Chat ID (optional)**
 - Message [@userinfobot](https://t.me/userinfobot) → it replies with your ID
+- Use this only if you want to restrict the bot to specific chats
 
 **Groq API key**
 - Sign up at [console.groq.com](https://console.groq.com) → API Keys → Create
@@ -58,7 +59,8 @@ gh repo create study-bot --private --push --source=.
 |---|---|
 | `BOT_TOKEN` | your Telegram bot token |
 | `GROQ_KEY` | your Groq API key |
-| `CHAT_ID` | your Telegram chat ID |
+| `ALLOWED_CHAT_IDS` | comma-separated list of allowed chat IDs (optional) |
+| `CHAT_ID` | legacy single chat ID (optional) |
 | `TOPIC_INTERVAL` | `600` (10 min) or `900` (15 min) |
 | `QUIZ_DELAY` | `1800` (30 min) |
 | `PORT` | `10000` |
@@ -70,7 +72,7 @@ gh repo create study-bot --private --push --source=.
 
 The bot now exposes a tiny HTTP health endpoint for Render while Telegram polling runs in the background.
 
-Note: Render free web services do not have persistent disks, so the SQLite file is ephemeral. That is usually fine here because sessions end after the PDF is learned.
+Note: Render free web services do not have persistent disks, so the SQLite file is ephemeral. Use `/export` to back up your progress before redeploying, then `/import` to restore it.
 
 ---
 
@@ -90,6 +92,8 @@ Note: Render free web services do not have persistent disks, so the SQLite file 
 | `/status` | Show learned vs remaining topics |
 | `/skip` | Skip and mark current topic as learned |
 | `/reset` | Clear everything, ready for a new PDF |
+| `/export` | Export your data as a JSON backup |
+| `/import` | Import a JSON backup (`/import merge` to merge) |
 
 ---
 
@@ -105,6 +109,13 @@ cp .env.example .env
 
 # run
 python bot.py
+```
+
+## Testing
+
+```bash
+python scripts/run_tests.py
+# or: python -m unittest discover -v
 ```
 
 > SQLite database (`study_bot.db`) is created automatically in the working directory.

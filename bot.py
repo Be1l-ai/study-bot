@@ -77,10 +77,32 @@ import storage
 
 BOT_TOKEN      = os.environ["BOT_TOKEN"]
 GROQ_KEY       = os.environ["GROQ_KEY"]
-CHAT_ID        = os.environ["CHAT_ID"]
 TOPIC_INTERVAL = int(os.environ.get("TOPIC_INTERVAL", "900"))   # default 15 min
 QUIZ_DELAY     = int(os.environ.get("QUIZ_DELAY",     "1800"))  # default 30 min
 WEB_PORT       = int(os.environ.get("PORT", "10000"))
+
+
+def _parse_allowed_chat_ids() -> set[str]:
+    raw = os.environ.get("ALLOWED_CHAT_IDS") or os.environ.get("CHAT_ID")
+    if not raw:
+        return set()
+    return {item.strip() for item in raw.split(",") if item.strip()}
+
+
+ALLOWED_CHAT_IDS = _parse_allowed_chat_ids()
+
+
+def _default_user_id() -> int | None:
+    if len(ALLOWED_CHAT_IDS) != 1:
+        return None
+    only_value = next(iter(ALLOWED_CHAT_IDS))
+    try:
+        return int(only_value)
+    except ValueError:
+        return None
+
+
+DEFAULT_USER_ID = _default_user_id()
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -92,16 +114,15 @@ logger = logging.getLogger(__name__)
 
 # ── Scheduler state (in-memory) ───────────────────────────────────────────────
 
-# Unix timestamp of when the last topic (or quiz) was sent.
-# The next topic fires only after TOPIC_INTERVAL seconds from this value.
-last_message_at: float = 0.0
+# Active /answer session per user.
+# user_id -> { "topic_id": int, "q_index": int, "score": int, "questions": [...], "answers": [...] }
+answer_sessions: dict[int, dict] = {}
 
-# True while a quiz is being generated / sent — blocks topic delivery.
-quiz_sending: bool = False
+# True while a quiz is being generated / sent — blocks topic delivery for that user.
+quiz_sending_by_user: dict[int, bool] = {}
 
-# Active /answer session: which quiz the user is currently working through.
-# { "topic_id": int, "q_index": int, "score": int, "questions": [...], "answers": [...] }
-answer_session: dict | None = None
+# Pending /import request per user (value is mode: replace|merge).
+pending_imports: dict[int, str] = {}
 
 
 class _HealthHandler(BaseHTTPRequestHandler):
@@ -141,8 +162,30 @@ def start_health_server() -> ThreadingHTTPServer:
 # Helpers
 # ═════════════════════════════════════════════════════════════════════════════
 
-def _is_me(update: Update) -> bool:
-    return str(update.effective_chat.id) == CHAT_ID
+def _is_allowed(update: Update) -> bool:
+    if not update.effective_chat:
+        return False
+    if not ALLOWED_CHAT_IDS:
+        return True
+    return str(update.effective_chat.id) in ALLOWED_CHAT_IDS
+
+
+def _is_allowed_user_id(user_id: int) -> bool:
+    if not ALLOWED_CHAT_IDS:
+        return True
+    return str(user_id) in ALLOWED_CHAT_IDS
+
+
+def _get_last_message_at(user_id: int) -> float:
+    raw = storage.get_user_state(user_id, "last_message_at", "0")
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _set_last_message_at(user_id: int, timestamp: float) -> None:
+    storage.set_user_state(user_id, "last_message_at", str(timestamp))
 
 
 def _format_question(q: dict, index: int, total: int) -> str:
@@ -163,7 +206,7 @@ def _answer_keyboard(topic_id: int, q_index: int, options: list[str]) -> InlineK
 # ═════════════════════════════════════════════════════════════════════════════
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_me(update):
+    if not _is_allowed(update):
         return
     await update.message.reply_text(
         "📚 Study Bot ready!\n\n"
@@ -171,19 +214,22 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/answer  — answer your oldest pending quiz\n"
         "/status  — see progress\n"
         "/skip    — skip current topic\n"
-        "/reset   — clear everything"
+        "/reset   — clear everything\n"
+        "/export  — backup your data\n"
+        "/import  — restore from a backup"
     )
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_me(update):
+    if not _is_allowed(update):
         return
-    if not storage.has_topics():
+    user_id = update.effective_chat.id
+    if not storage.has_topics(user_id):
         await update.message.reply_text("No active session. Send me a PDF!")
         return
-    total   = storage.total_count()
-    learned = storage.learned_count()
-    pending = storage.pending_quiz_count()
+    total   = storage.total_count(user_id)
+    learned = storage.learned_count(user_id)
+    pending = storage.pending_quiz_count(user_id)
     await update.message.reply_text(
         f"📊 Progress\n\n"
         f"✅ Learned  : {learned} / {total}\n"
@@ -193,54 +239,94 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_me(update):
+    if not _is_allowed(update):
         return
-    topic = storage.get_next_unsent()
+    user_id = update.effective_chat.id
+    topic = storage.get_next_unsent(user_id)
     if not topic:
         await update.message.reply_text("Nothing to skip right now.")
         return
-    storage.mark_learned(topic["id"])
+    storage.mark_learned(user_id, topic["id"])
     await update.message.reply_text("⏭ Topic skipped and marked as learned.")
 
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_me(update):
+    if not _is_allowed(update):
         return
-    global last_message_at, quiz_sending, answer_session
-    storage.clear_all()
-    last_message_at = 0.0
-    quiz_sending    = False
-    answer_session  = None
+    user_id = update.effective_chat.id
+    storage.clear_all(user_id)
+    storage.set_user_state(user_id, "last_message_at", "0")
+    answer_sessions.pop(user_id, None)
+    quiz_sending_by_user.pop(user_id, None)
+    pending_imports.pop(user_id, None)
     await update.message.reply_text("🔄 Reset. Send me a new PDF!")
+
+
+async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_allowed(update):
+        return
+    user_id = update.effective_chat.id
+    chat_id = update.effective_chat.id
+
+    payload = storage.export_user_data(user_id)
+    filename = f"study_bot_backup_{user_id}.json"
+
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as tmp:
+        json.dump(payload, tmp, ensure_ascii=True, indent=2)
+        tmp_path = tmp.name
+
+    try:
+        with open(tmp_path, "rb") as file_obj:
+            await context.bot.send_document(chat_id=chat_id, document=file_obj, filename=filename)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+
+async def cmd_import(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_allowed(update):
+        return
+    user_id = update.effective_chat.id
+    mode = "replace"
+    if context.args and context.args[0].lower() == "merge":
+        mode = "merge"
+    pending_imports[user_id] = mode
+    await update.message.reply_text(
+        "📦 Send your JSON backup file in this chat to import it."
+    )
 
 
 # ── /answer ───────────────────────────────────────────────────────────────────
 
 async def cmd_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start (or resume) answering the oldest pending quiz."""
-    global answer_session
-    if not _is_me(update):
+    if not _is_allowed(update):
         return
+    user_id = update.effective_chat.id
+    chat_id = update.effective_chat.id
+    session = answer_sessions.get(user_id)
 
-    if answer_session:
+    if session:
         # Already in a session — remind user to finish it
-        q = answer_session["questions"][answer_session["q_index"]]
+        q = session["questions"][session["q_index"]]
         await update.message.reply_text(
             "You already have an active quiz. Answer the question below 👇",
             reply_markup=_answer_keyboard(
-                answer_session["topic_id"],
-                answer_session["q_index"],
+                session["topic_id"],
+                session["q_index"],
                 q["options"],
             ),
         )
-        await update.message.reply_text(_format_question(
-            q, answer_session["q_index"], len(answer_session["questions"])
-        ))
+        await update.message.reply_text(
+            _format_question(q, session["q_index"], len(session["questions"]))
+        )
         return
 
-    topic = storage.get_oldest_unanswered_quiz()
+    topic = storage.get_oldest_unanswered_quiz(user_id)
     if not topic:
-        pending = storage.pending_quiz_count()
+        pending = storage.pending_quiz_count(user_id)
         if pending == 0:
             await update.message.reply_text("No pending quizzes right now. Keep studying! 📖")
         return
@@ -248,7 +334,7 @@ async def cmd_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     questions = json.loads(topic["quiz_questions"])
     answers   = json.loads(topic["quiz_answers"])
 
-    answer_session = {
+    answer_sessions[user_id] = {
         "topic_id":  topic["id"],
         "q_index":   0,
         "score":     0,
@@ -256,33 +342,37 @@ async def cmd_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "answers":   answers,
     }
 
-    await _send_current_question(context.bot)
+    await _send_current_question(context.bot, user_id, chat_id)
 
 
-async def _send_current_question(bot):
-    if not answer_session:
+async def _send_current_question(bot, user_id: int, chat_id: int):
+    session = answer_sessions.get(int(user_id))
+    if not session:
         return
-    q       = answer_session["questions"][answer_session["q_index"]]
-    total   = len(answer_session["questions"])
-    text    = _format_question(q, answer_session["q_index"], total)
+    q       = session["questions"][session["q_index"]]
+    total   = len(session["questions"])
+    text    = _format_question(q, session["q_index"], total)
     markup  = _answer_keyboard(
-        answer_session["topic_id"],
-        answer_session["q_index"],
+        session["topic_id"],
+        session["q_index"],
         q["options"],
     )
-    await bot.send_message(chat_id=CHAT_ID, text=text, reply_markup=markup)
+    await bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
 
 
 # ── Inline button answer handler ──────────────────────────────────────────────
 
 async def handle_answer_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """callback_data format: ans_{topic_id}_{q_index}_{letter}"""
-    global answer_session, last_message_at
-
     query = update.callback_query
     await query.answer()
 
-    if not _is_me(update) or not answer_session:
+    if not _is_allowed(update):
+        return
+
+    user_id = update.effective_chat.id
+    session = answer_sessions.get(user_id)
+    if not session:
         return
 
     parts = query.data.split("_")
@@ -294,15 +384,15 @@ async def handle_answer_button(update: Update, context: ContextTypes.DEFAULT_TYP
     chosen   = parts[3]
 
     # Guard: button must match the active session
-    if topic_id != answer_session["topic_id"] or q_index != answer_session["q_index"]:
+    if topic_id != session["topic_id"] or q_index != session["q_index"]:
         await query.edit_message_text("This question is no longer active. Use /answer.")
         return
 
-    correct = answer_session["answers"][q_index]
-    q       = answer_session["questions"][q_index]
+    correct = session["answers"][q_index]
+    q       = session["questions"][q_index]
 
     if chosen == correct:
-        answer_session["score"] += 1
+        session["score"] += 1
         feedback = f"✅ Correct! ({chosen})"
     else:
         correct_label = next((o for o in q["options"] if o.startswith(correct)), correct)
@@ -310,49 +400,51 @@ async def handle_answer_button(update: Update, context: ContextTypes.DEFAULT_TYP
 
     # Edit the question message to show result
     await query.edit_message_text(
-        f"🧪 Quiz  (Q{q_index + 1}/{len(answer_session['questions'])})\n\n"
+        f"🧪 Quiz  (Q{q_index + 1}/{len(session['questions'])})\n\n"
         f"{q['question']}\n\n"
         f"Your answer: {chosen}\n{feedback}"
     )
 
-    answer_session["q_index"] += 1
+    session["q_index"] += 1
 
-    if answer_session["q_index"] >= len(answer_session["questions"]):
+    if session["q_index"] >= len(session["questions"]):
         # ── Quiz complete ──
-        score   = answer_session["score"]
-        total_q = len(answer_session["questions"])
+        score   = session["score"]
+        total_q = len(session["questions"])
         passed  = score >= round(total_q * 0.6)  # 60 % threshold
-        tid     = answer_session["topic_id"]
-        answer_session = None
+        tid     = session["topic_id"]
+        answer_sessions.pop(user_id, None)
 
-        storage.mark_quiz_answered(tid)
+        storage.mark_quiz_answered(user_id, tid)
         await asyncio.sleep(0.5)
 
         if passed:
-            storage.mark_learned(tid)
-            learned   = storage.learned_count()
-            all_total = storage.total_count()
+            storage.mark_learned(user_id, tid)
+            learned   = storage.learned_count(user_id)
+            all_total = storage.total_count(user_id)
             await context.bot.send_message(
-                chat_id=CHAT_ID,
+                chat_id=user_id,
                 text=(
                     f"🎓 Passed! {score}/{total_q}\n"
                     f"Topic learned. ({learned}/{all_total} done)"
                 ),
             )
-            if storage.all_learned():
+            if storage.all_learned(user_id):
                 await context.bot.send_message(
-                    chat_id=CHAT_ID,
+                    chat_id=user_id,
                     text=(
                         "🏆 You've learned every topic in this PDF!\n\n"
                         "Send me a new PDF whenever you're ready."
                     ),
                 )
-                storage.clear_all()
+                storage.clear_all(user_id)
+                quiz_sending_by_user.pop(user_id, None)
+                pending_imports.pop(user_id, None)
         else:
-            storage.reset_sent(tid)
+            storage.reset_sent(user_id, tid)
             # Reset the topic-send clock so this resent topic arrives on the next normal slot
             await context.bot.send_message(
-                chat_id=CHAT_ID,
+                chat_id=user_id,
                 text=(
                     f"📚 Not quite — {score}/{total_q}. Need 60 % to pass.\n"
                     f"This topic will be resent on the next slot. You've got this! 💪"
@@ -360,34 +452,70 @@ async def handle_answer_button(update: Update, context: ContextTypes.DEFAULT_TYP
             )
 
         # Remind about remaining queued quizzes
-        remaining_q = storage.pending_quiz_count()
+        remaining_q = storage.pending_quiz_count(user_id)
         if remaining_q > 0:
             await context.bot.send_message(
-                chat_id=CHAT_ID,
+                chat_id=user_id,
                 text=f"📋 You still have {remaining_q} quiz(es) pending. Use /answer when ready.",
             )
     else:
         # Next question
         await asyncio.sleep(0.5)
-        await _send_current_question(context.bot)
+        await _send_current_question(context.bot, user_id, user_id)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
 # PDF handler
 # ═════════════════════════════════════════════════════════════════════════════
 
-async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global last_message_at
-
-    if not _is_me(update):
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_allowed(update):
         return
 
     doc = update.message.document
-    if not doc or not doc.file_name.lower().endswith(".pdf"):
-        await update.message.reply_text("Please send a .pdf file.")
+    if not doc:
         return
 
-    if storage.has_topics():
+    user_id = update.effective_chat.id
+    filename = (doc.file_name or "").lower()
+    is_pdf = filename.endswith(".pdf") or doc.mime_type == "application/pdf"
+    is_json = filename.endswith(".json") or doc.mime_type == "application/json"
+
+    if is_json:
+        if user_id not in pending_imports:
+            await update.message.reply_text("Use /import first, then send your backup file here.")
+            return
+
+        mode = pending_imports.get(user_id, "replace")
+        status_msg = await update.message.reply_text("⬇️ Downloading backup…")
+        tg_file = await context.bot.get_file(doc.file_id)
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
+            await tg_file.download_to_drive(tmp.name)
+            json_path = tmp.name
+
+        try:
+            data = json.loads(Path(json_path).read_text(encoding="utf-8"))
+            result = storage.import_user_data(user_id, data, mode=mode)
+        except Exception as e:
+            logger.error("Import failed: %s", e)
+            await status_msg.edit_text(f"❌ Import failed: {e}")
+        else:
+            await status_msg.edit_text(
+                f"✅ Import complete. Topics: {result['topics']}, State: {result['state']}"
+            )
+        finally:
+            pending_imports.pop(user_id, None)
+            try:
+                os.unlink(json_path)
+            except Exception:
+                pass
+        return
+
+    if not is_pdf:
+        await update.message.reply_text("Please send a PDF or a JSON backup file.")
+        return
+
+    if storage.has_topics(user_id):
         await update.message.reply_text(
             "⚠️ You have an unfinished session!\n"
             "Use /reset first if you want to start a new PDF."
@@ -430,8 +558,8 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
         interesting = make_interesting(raw, GROQ_KEY)
         processed.append((raw, interesting))
 
-    storage.add_topics(processed)
-    last_message_at = 0.0  # send first topic on next loop tick
+    storage.add_topics(user_id, processed)
+    _set_last_message_at(user_id, 0.0)  # send first topic on next loop tick
 
     await status_msg.edit_text(
         f"✅ Session started!\n\n"
@@ -446,9 +574,9 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Scheduler helpers
 # ═════════════════════════════════════════════════════════════════════════════
 
-async def _send_next_topic(bot) -> bool:
+async def _send_next_topic(bot, user_id: int) -> bool:
     """Send next unsent topic. Returns True if sent."""
-    topic = storage.get_next_unsent()
+    topic = storage.get_next_unsent(user_id)
     if not topic:
         return False
     text = (
@@ -458,26 +586,24 @@ async def _send_next_topic(bot) -> bool:
         f"Quiz in 30 min — use /answer when it arrives"
     )
     try:
-        msg = await bot.send_message(chat_id=CHAT_ID, text=text)
-        storage.mark_sent(topic["id"], msg.message_id)
-        logger.info("Sent topic id=%s", topic["id"])
+        msg = await bot.send_message(chat_id=user_id, text=text)
+        storage.mark_sent(user_id, topic["id"], msg.message_id)
+        logger.info("Sent topic id=%s user_id=%s", topic["id"], user_id)
         return True
     except Exception as e:
         logger.error("Failed to send topic: %s", e)
         return False
 
 
-async def _run_quiz_for_topic(bot, topic: dict):
+async def _run_quiz_for_topic(bot, user_id: int, topic: dict):
     """Delete topic message, generate quiz, store Q+A, send only questions."""
-    global quiz_sending, last_message_at
-
-    quiz_sending = True
-    logger.info("Generating quiz for topic id=%s", topic["id"])
+    quiz_sending_by_user[user_id] = True
+    logger.info("Generating quiz for topic id=%s user_id=%s", topic["id"], user_id)
 
     # Delete the study message from chat (keep in DB)
     if topic.get("message_id"):
         try:
-            await bot.delete_message(chat_id=CHAT_ID, message_id=topic["message_id"])
+            await bot.delete_message(chat_id=user_id, message_id=topic["message_id"])
         except Exception:
             pass
 
@@ -486,14 +612,14 @@ async def _run_quiz_for_topic(bot, topic: dict):
     if not result:
         # Quiz generation failed — auto-mark as learned, don't block forever
         logger.warning("Quiz gen failed for topic id=%s, auto-learned", topic["id"])
-        storage.mark_learned(topic["id"])
+        storage.mark_learned(user_id, topic["id"])
         storage.set_state(f"quiz_generated_{topic['id']}", "1")  # prevent retry loop
-        quiz_sending = False
+        quiz_sending_by_user[user_id] = False
         return
 
     questions_json = json.dumps(result["questions"])
     answers_json   = json.dumps(result["answers"])
-    storage.store_quiz(topic["id"], questions_json, answers_json)
+    storage.store_quiz(user_id, topic["id"], questions_json, answers_json)
 
     # Build the quiz message — questions only, no answers
     lines = [f"🧪 Quiz ready for topic #{topic['id']}\n"]
@@ -505,17 +631,17 @@ async def _run_quiz_for_topic(bot, topic: dict):
     lines.append("Use /answer to start answering.")
 
     try:
-        await bot.send_message(chat_id=CHAT_ID, text="\n".join(lines))
-        storage.mark_quiz_delivered(topic["id"])
-        logger.info("Quiz delivered for topic id=%s", topic["id"])
+        await bot.send_message(chat_id=user_id, text="\n".join(lines))
+        storage.mark_quiz_delivered(user_id, topic["id"])
+        logger.info("Quiz delivered for topic id=%s user_id=%s", topic["id"], user_id)
     except Exception as e:
         logger.error("Failed to send quiz message: %s", e)
 
     # Reset the topic-send clock after quiz delivery so the next topic
     # arrives TOPIC_INTERVAL seconds from NOW (not from the previous topic).
     import time
-    last_message_at = time.time()
-    quiz_sending    = False
+    _set_last_message_at(user_id, time.time())
+    quiz_sending_by_user[user_id] = False
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -524,33 +650,35 @@ async def _run_quiz_for_topic(bot, topic: dict):
 
 async def scheduler_loop(app: Application):
     import time
-
-    global last_message_at, quiz_sending
-
     await asyncio.sleep(10)
     logger.info("Scheduler loop started.")
 
     while True:
         try:
             now = time.time()
+            user_ids = storage.get_active_user_ids()
 
-            # ── 1. Trigger quizzes for overdue topics (one at a time) ────────
-            for topic in storage.get_topics_ready_for_quiz(QUIZ_DELAY):
-                await _run_quiz_for_topic(app.bot, topic)
-                # _run_quiz_for_topic already resets last_message_at
-                now = time.time()
-                break  # handle only one per loop tick to keep messages spaced
+            for user_id in user_ids:
+                if not _is_allowed_user_id(user_id):
+                    continue
 
-            # ── 2. Send next topic if interval has elapsed and no quiz sending
-            if (
-                not quiz_sending
-                and storage.has_topics()
-                and not storage.all_learned()
-                and (now - last_message_at) >= TOPIC_INTERVAL
-            ):
-                sent = await _send_next_topic(app.bot)
-                if sent:
-                    last_message_at = time.time()
+                if quiz_sending_by_user.get(user_id, False):
+                    continue
+
+                ready = storage.get_topics_ready_for_quiz(user_id, QUIZ_DELAY)
+                if ready:
+                    await _run_quiz_for_topic(app.bot, user_id, ready[0])
+                    now = time.time()
+                    continue
+
+                if not storage.has_topics(user_id) or storage.all_learned(user_id):
+                    continue
+
+                last_message_at = _get_last_message_at(user_id)
+                if (now - last_message_at) >= TOPIC_INTERVAL:
+                    sent = await _send_next_topic(app.bot, user_id)
+                    if sent:
+                        _set_last_message_at(user_id, time.time())
 
         except Exception as e:
             logger.error("Scheduler error: %s", e)
@@ -563,7 +691,7 @@ async def scheduler_loop(app: Application):
 # ═════════════════════════════════════════════════════════════════════════════
 
 async def on_startup(app: Application):
-    storage.init_db()
+    storage.init_db(default_user_id=DEFAULT_USER_ID)
     asyncio.create_task(scheduler_loop(app))
     logger.info("Bot started.")
 
@@ -585,7 +713,9 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("skip",   cmd_skip))
     app.add_handler(CommandHandler("reset",  cmd_reset))
     app.add_handler(CommandHandler("answer", cmd_answer))
-    app.add_handler(MessageHandler(filters.Document.PDF, handle_pdf))
+    app.add_handler(CommandHandler("export", cmd_export))
+    app.add_handler(CommandHandler("import", cmd_import))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(CallbackQueryHandler(handle_answer_button, pattern=r"^ans_"))
     return app
 
